@@ -1,0 +1,248 @@
+WireGuard for 9front — Initial Analysis
+========================================
+
+Challenge: Implement a WireGuard client for the 9front operating system.
+Issued by: a friend
+Key success criteria from the challenger:
+  1. BLAKE2s hashing implemented from scratch, with test vectors
+  2. Full client implementation of the VPN protocol, including sessions and keepalives
+  3. Handle edge cases: intermittent connection loss, traffic replay
+  4. Must connect to a standard WireGuard server running on Linux
+
+
+Crypto Primitives — What the whitepaper specifies
+--------------------------------------------------
+
+The protocol identifier is "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s".
+
+Function          WireGuard uses                   libsec provides
+--------          --------------                   ---------------
+DH()              Curve25519                       curve25519_dh_new, curve25519_dh_finish
+Aead()            ChaCha20-Poly1305 (RFC 7539)     ccpoly_encrypt, ccpoly_decrypt
+Xaead()           XChaCha20-Poly1305               hchacha + ccpoly_*
+Hash()            BLAKE2s(input, 32)               MISSING
+Mac()             Keyed-BLAKE2s(key, input, 16)    MISSING
+Hmac()            HMAC-BLAKE2s                     MISSING (hmac_x exists but needs BLAKE2s)
+Kdf()             HKDF using HMAC-BLAKE2s          hkdf_x exists but needs BLAKE2s
+Timestamp()       TAI64N (12 bytes, big-endian)    Need to implement
+DH-Generate()     Random Curve25519 keypair        curve25519_dh_new
+genrandom()       Crypto-secure random bytes       genrandom
+
+
+The Critical Gap: BLAKE2s
+-------------------------
+
+BLAKE2s is the central hash for the entire protocol. It appears in:
+  - Hash(): chaining key derivation, protocol state hashing (32-byte output)
+  - Mac(): keyed MAC variant for mac1, mac2, cookie system (16-byte output)
+  - Hmac(): HMAC construction over BLAKE2s, used in HKDF/KDF
+  - Kdf(): key derivation (HKDF built on HMAC-BLAKE2s)
+
+This must be implemented from scratch with test vectors per the challenger's requirement.
+BLAKE2s operates on 32-bit words (unlike BLAKE2b which uses 64-bit words),
+making it well-suited for the range of platforms 9front targets.
+
+
+Protocol Messages
+-----------------
+
+Four message types, each prefixed by a 1-byte type identifier:
+
+1. Handshake Initiation (type=0x1, 148 bytes)
+   - Initiator to Responder
+   - Contains: sender index, ephemeral pubkey, encrypted static pubkey,
+     encrypted TAI64N timestamp, mac1, mac2
+   - Establishes initiator identity via Noise IK pattern
+
+2. Handshake Response (type=0x2, 92 bytes)
+   - Responder to Initiator
+   - Contains: sender index, receiver index, ephemeral pubkey,
+     encrypted empty, mac1, mac2
+   - Completes the 1-RTT key exchange
+
+3. Cookie Reply (type=0x3, 64 bytes)
+   - Sent when under load instead of processing handshake
+   - Contains: receiver index, 24-byte nonce, encrypted cookie
+   - Uses XChaCha20-Poly1305 with responder's public key
+
+4. Transport Data (type=0x4, 32 + payload bytes)
+   - Encrypted tunnel packets
+   - Contains: receiver index, 8-byte counter, AEAD-encrypted payload
+   - Counter serves as nonce and replay protection
+
+
+Noise IK Handshake Detail
+-------------------------
+
+Initial state:
+  C = Hash("Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s")    [chaining key]
+  H = Hash(C || "WireGuard v1 zx2c4 Jason@zx2c4.com")  [hash]
+  H = Hash(H || S_r^pub)                                 [mix responder pubkey]
+
+First message (initiator -> responder):
+  Generate ephemeral keypair (E_i^priv, E_i^pub)
+  C = Kdf1(C, E_i^pub)
+  H = Hash(H || E_i^pub)
+  (C, k) = Kdf2(C, DH(E_i^priv, S_r^pub))     [ephemeral-static DH]
+  msg.static = Aead(k, 0, S_i^pub, H)           [encrypt initiator's pubkey]
+  H = Hash(H || msg.static)
+  (C, k) = Kdf2(C, DH(S_i^priv, S_r^pub))     [static-static DH]
+  msg.timestamp = Aead(k, 0, Timestamp(), H)    [encrypt timestamp]
+  H = Hash(H || msg.timestamp)
+
+Second message (responder -> initiator):
+  Generate ephemeral keypair (E_r^priv, E_r^pub)
+  C = Kdf1(C, E_r^pub)
+  H = Hash(H || E_r^pub)
+  C = Kdf1(C, DH(E_r^priv, E_i^pub))          [ephemeral-ephemeral DH]
+  C = Kdf1(C, DH(E_r^priv, S_i^pub))          [ephemeral-static DH]
+  (C, tau, k) = Kdf3(C, Q)                      [mix pre-shared key]
+  H = Hash(H || tau)
+  msg.empty = Aead(k, 0, "", H)                 [encrypt empty payload]
+  H = Hash(H || msg.empty)
+
+Transport key derivation:
+  (T_i^send = T_r^recv, T_i^recv = T_r^send) = Kdf2(C, "")
+  All nonce counters initialized to 0
+  Ephemeral keys and chaining key zeroed from memory
+
+
+Cookie MAC System
+-----------------
+
+All handshake messages carry mac1 and mac2:
+
+  mac1 = Mac(Hash("mac1----" || S_peer^pub), msg_alpha)
+    - Always required and validated
+    - Proves knowledge of peer's public key
+
+  mac2 = Mac(cookie, msg_beta)     [if cookie available and < 120s old]
+    - OR 16 zero bytes if no valid cookie
+    - Only checked when responder is under load
+    - Proves IP ownership via cookie mechanism
+
+Cookie reply uses XChaCha20-Poly1305:
+  cookie = Mac(R_m, A_peer)        [R_m = 2-minute rotating secret, A = IP:port]
+  msg.cookie = Xaead(Hash("cookie--" || S_m^pub), nonce, cookie, mac1_of_trigger)
+
+
+Timer State Machine
+-------------------
+
+Constants:
+  Rekey-After-Messages    2^60 messages
+  Reject-After-Messages   2^64 - 2^13 - 1 messages
+  Rekey-After-Time        120 seconds
+  Reject-After-Time       180 seconds
+  Rekey-Attempt-Time      90 seconds
+  Rekey-Timeout           5 seconds
+  Keepalive-Timeout       10 seconds
+
+Key behaviors:
+  - Handshake retransmission every Rekey-Timeout (5s) for up to
+    Rekey-Attempt-Time (90s)
+  - Passive keepalive: if data received but nothing to send for 10s,
+    send empty transport message (just the 16-byte Poly1305 tag)
+  - Rekey after 120s or 2^60 messages, whichever comes first
+  - Reject sessions older than 180s or exceeding message limit
+  - Session rotation: current/previous/next slots for seamless handover
+  - Jitter added to timer-based rekey to avoid thundering herd
+  - Connection considered dead after Keepalive-Timeout + Rekey-Timeout (15s)
+    with no response, triggering new handshake attempts
+  - Cookie reply does NOT trigger immediate retransmission; wait for
+    Rekey-Timeout expiry
+
+Session management:
+  - Three session slots: current, previous, next (unconfirmed)
+  - New session rotates current -> previous, discards previous-previous
+  - After Reject-After-Time * 3 with no new session, all sessions zeroed
+  - Responder cannot send transport data until first transport message
+    received from initiator (KEA+C confirmation)
+
+
+Transport Data Details
+----------------------
+
+  - Packets zero-padded to 16-byte boundary before encryption
+  - 16-byte header (type + reserved + receiver + counter) aligned for
+    in-place decryption
+  - Counter is 64-bit, serves as ChaCha20-Poly1305 nonce
+  - Replay protection via sliding window (RFC 6479)
+  - No length field in header; authentication tag validates legitimacy,
+    inner IP packet has its own length
+
+
+libsec Inventory (from drawterm/libsec)
+----------------------------------------
+
+Available and needed:
+  curve25519.c, curve25519_dh.c    Curve25519 DH
+  chacha.c, chachablock.c          ChaCha20 (including XChaCha20 via hchacha)
+  poly1305.c                       Poly1305 MAC
+  ccpoly.c                         ChaCha20-Poly1305 AEAD
+  hmac.c                           Generic HMAC (needs BLAKE2s as hash)
+  hkdf.c                           Generic HKDF (needs HMAC-BLAKE2s)
+  genrandom.c                      Cryptographic random bytes
+  tsmemcmp.c                       Timing-safe memory comparison
+
+Available but not needed for WireGuard:
+  AES, DES, RC4, SHA1/2, MD5, RSA, DSA, ECDSA, X.509, etc.
+
+
+Implementation Order
+--------------------
+
+Phase 1: BLAKE2s
+  - Implement from scratch per RFC 7693
+  - Both unkeyed (32-byte output) and keyed MAC (16-byte output) modes
+  - Test against official BLAKE2s test vectors
+  - Wire into HMAC and HKDF via libsec's generic interfaces
+
+Phase 2: Noise IK Handshake
+  - Implement the Noise protocol state machine
+  - Hash(), Mac(), Hmac(), Kdf() wrappers using BLAKE2s
+  - Handshake initiation (type=1) construction and parsing
+  - Handshake response (type=2) construction and parsing
+  - Transport key derivation
+  - TAI64N timestamp generation and comparison
+
+Phase 3: Transport Data
+  - Encrypt/decrypt with counter-based nonces
+  - Sliding window replay protection (RFC 6479)
+  - Zero-padding to 16-byte boundaries
+  - In-place encryption/decryption
+
+Phase 4: Timer State Machine
+  - Session management (current/previous/next slots)
+  - Handshake retransmission with jitter
+  - Passive keepalives
+  - Key rotation triggers
+  - Connection failure detection
+
+Phase 5: Cookie/DoS System
+  - mac1/mac2 computation and validation
+  - Cookie reply message (type=3)
+  - XChaCha20-Poly1305 cookie encryption
+  - 2-minute rotating secret
+
+Phase 6: Network Integration (9front-specific)
+  - UDP socket for outer packets
+  - TUN/interface integration for inner packets
+  - Cryptokey routing table
+  - Configuration interface
+  - Testing against Linux WireGuard server via QEMU
+
+
+Testing Strategy
+----------------
+
+  - BLAKE2s: official test vectors from RFC 7693 and blake2s reference
+  - Handshake: known test vectors from WireGuard test suite
+  - Transport: encrypt/decrypt round-trip tests
+  - Integration: connect to Linux WireGuard server, verify:
+    * Initial handshake completes
+    * Bidirectional data transfer works
+    * Keepalives maintain session
+    * Recovery from simulated connection loss
+    * Rekey works after timeout
+    * Replay of old packets is rejected
