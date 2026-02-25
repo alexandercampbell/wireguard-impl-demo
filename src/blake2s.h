@@ -16,8 +16,14 @@
 #define BLAKE2S_OUTBYTES    32
 #define BLAKE2S_KEYBYTES    32
 
+#ifndef _P9_UINT32
+#define _P9_UINT32
 typedef unsigned int uint32;
+#endif
+#ifndef _P9_UCHAR
+#define _P9_UCHAR
 typedef unsigned char uchar;
+#endif
 
 typedef struct {
 	uint32 h[8];                    /* state */
